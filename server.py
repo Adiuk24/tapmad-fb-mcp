@@ -4,6 +4,7 @@ import requests
 from typing import Dict, List, Optional, Any
 import json
 import requests
+import os
 import sys
 from urllib.parse import urlsplit
 
@@ -48,8 +49,11 @@ def _get_fb_access_token() -> str:
                 print(f"Using Facebook token from command line arguments")
             else:
                 raise Exception("--fb-token argument provided but no token value followed it")
+        elif os.environ.get("FB_ACCESS_TOKEN"):
+            FB_ACCESS_TOKEN = os.environ["FB_ACCESS_TOKEN"]
+            print("Using Facebook token from FB_ACCESS_TOKEN environment variable")
         else:
-            raise Exception("Facebook token must be provided via '--fb-token' command line argument")
+            raise Exception("Facebook token must be provided via '--fb-token' argument or FB_ACCESS_TOKEN env var")
 
     return FB_ACCESS_TOKEN
 
@@ -2322,6 +2326,139 @@ def get_activities_by_adset(
             params['until'] = until
     
     return _make_graph_api_call(url, params)
+
+
+# --- Page monitoring tools (Tapmad addition) ---
+
+def _page_token(page_id: str) -> Optional[str]:
+    """A Page's own edges (posts, insights) need a Page access token, not the
+    user token. Derive it from /me/accounts; fall back to the user token if
+    the page isn't listed (public reads still work)."""
+    try:
+        accounts = _fetch_edge('me', 'accounts', fields=['id', 'access_token'], limit=100)
+        for acc in accounts.get('data', []):
+            if acc.get('id') == page_id and acc.get('access_token'):
+                return acc['access_token']
+    except Exception:
+        pass
+    return None
+
+def _fetch_page_edge(page_id: str, edge_name: str, **kwargs) -> Dict:
+    token = _page_token(page_id) or _get_fb_access_token()
+    url = f"{FB_GRAPH_URL}/{page_id}/{edge_name}"
+    params = _prepare_params({'access_token': token}, **kwargs)
+    return _make_graph_api_call(url, params)
+
+@mcp.tool()
+def list_pages() -> Dict:
+    """List all Facebook Pages the current token can manage (id, name, category, fan_count)."""
+    return _fetch_edge('me', 'accounts', fields=['id', 'name', 'category', 'fan_count'], limit=100)
+
+@mcp.tool()
+def get_page_details(page_id: str, fields: Optional[List[str]] = None) -> Dict:
+    """Get details of a Facebook Page. Default fields: name, about, fan_count,
+    followers_count, link, category, rating_count, overall_star_rating."""
+    return _fetch_node(page_id, fields=fields or [
+        'name', 'about', 'fan_count', 'followers_count', 'link',
+        'category', 'rating_count', 'overall_star_rating'])
+
+@mcp.tool()
+def get_page_posts(page_id: str, limit: int = 25, since: Optional[str] = None,
+                   until: Optional[str] = None) -> Dict:
+    """Get recent posts of a Page with engagement counts (reactions, comments, shares).
+    since/until are YYYY-MM-DD or unix timestamps."""
+    base_fields = ['id', 'message', 'created_time', 'permalink_url', 'is_published', 'shares']
+    engagement_fields = ['reactions.summary(total_count).limit(0)',
+                         'comments.summary(total_count).limit(0)']
+    kwargs: Dict[str, Any] = {'fields': base_fields + engagement_fields, 'limit': limit}
+    if since: kwargs['since'] = since
+    if until: kwargs['until'] = until
+    try:
+        return _fetch_page_edge(page_id, 'published_posts', **kwargs)
+    except Exception:
+        # reaction/comment counts need pages_read_user_content; degrade without them
+        kwargs['fields'] = base_fields
+        result = _fetch_page_edge(page_id, 'published_posts', **kwargs)
+        result['note'] = ("Engagement counts omitted: token lacks the "
+                          "'pages_read_user_content' permission.")
+        return result
+
+@mcp.tool()
+def get_post_comments(post_id: str, limit: int = 25, order: str = 'reverse_chronological') -> Dict:
+    """Get comments on a post/ad post. post_id format: <page_id>_<post_id>.
+    order: 'chronological' or 'reverse_chronological' (newest first)."""
+    page_id = post_id.split('_')[0]
+    token = _page_token(page_id) or _get_fb_access_token()
+    url = f"{FB_GRAPH_URL}/{post_id}/comments"
+    params = _prepare_params({'access_token': token}, fields=[
+        'id', 'message', 'created_time', 'like_count', 'comment_count', 'from'],
+        limit=limit, order=order)
+    return _make_graph_api_call(url, params)
+
+@mcp.tool()
+def get_page_insights(page_id: str, metrics: Optional[List[str]] = None,
+                      period: str = 'day', since: Optional[str] = None,
+                      until: Optional[str] = None) -> Dict:
+    """Get Page-level insights. Default metrics: page_post_engagements,
+    page_follows, page_video_views, page_views_total (page_impressions* and
+    page_fans were deprecated by Meta in Graph API v22).
+    period: day | week | days_28. since/until: YYYY-MM-DD."""
+    kwargs: Dict[str, Any] = {
+        'metric': ','.join(metrics or [
+            'page_post_engagements', 'page_follows',
+            'page_video_views', 'page_views_total']),
+        'period': period}
+    if since: kwargs['since'] = since
+    if until: kwargs['until'] = until
+    return _fetch_page_edge(page_id, 'insights', **kwargs)
+
+@mcp.tool()
+def get_post_insights(post_id: str, metrics: Optional[List[str]] = None) -> Dict:
+    """Get insights for one post. Default metrics: post_clicks,
+    post_reactions_like_total (post_impressions* deprecated in Graph API v22)."""
+    page_id = post_id.split('_')[0]
+    token = _page_token(page_id) or _get_fb_access_token()
+    url = f"{FB_GRAPH_URL}/{post_id}/insights"
+    params = _prepare_params({'access_token': token}, metric=','.join(metrics or [
+        'post_clicks', 'post_reactions_like_total']))
+    return _make_graph_api_call(url, params)
+
+
+# --- Instagram monitoring tools (via linked IG business accounts) ---
+
+@mcp.tool()
+def list_instagram_accounts() -> Dict:
+    """List Instagram business accounts linked to your Facebook Pages
+    (id, username, followers_count, media_count)."""
+    return _fetch_edge('me', 'accounts', fields=[
+        'id', 'name', 'instagram_business_account{id,username,followers_count,media_count}'],
+        limit=100)
+
+@mcp.tool()
+def get_instagram_media(ig_user_id: str, limit: int = 25) -> Dict:
+    """Get recent Instagram posts/reels with engagement (like_count, comments_count).
+    ig_user_id is the Instagram business account id from list_instagram_accounts."""
+    return _fetch_edge(ig_user_id, 'media', fields=[
+        'id', 'caption', 'media_type', 'media_product_type', 'permalink',
+        'timestamp', 'like_count', 'comments_count'], limit=limit)
+
+@mcp.tool()
+def get_instagram_media_comments(media_id: str, limit: int = 25) -> Dict:
+    """Get comments on one Instagram post (id from get_instagram_media)."""
+    return _fetch_edge(media_id, 'comments', fields=[
+        'id', 'text', 'timestamp', 'like_count', 'username'], limit=limit)
+
+@mcp.tool()
+def get_instagram_insights(ig_user_id: str, metrics: Optional[List[str]] = None,
+                           period: str = 'day', since: Optional[str] = None,
+                           until: Optional[str] = None) -> Dict:
+    """Get Instagram account insights. Default metrics: reach, follower_count.
+    Requires the instagram_manage_insights permission on the token."""
+    kwargs: Dict[str, Any] = {'metric': ','.join(metrics or ['reach', 'follower_count']),
+                              'period': period}
+    if since: kwargs['since'] = since
+    if until: kwargs['until'] = until
+    return _fetch_edge(ig_user_id, 'insights', **kwargs)
 
 
 if __name__ == "__main__":

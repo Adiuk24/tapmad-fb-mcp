@@ -1,2 +1,3 @@
-lib/
-facebook-ads-mcp-server.dxt
+.venv/
+__pycache__/
+*.pyc
