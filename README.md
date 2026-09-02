@@ -1,6 +1,6 @@
 # Tapmad FB MCP — Meta Ads + Page & Instagram Monitoring
 
-Open-source MCP server for **Facebook Ads management, Facebook Page monitoring, and Instagram monitoring** — built for [Tapmad](https://www.tapmad.com). Fork of the MIT-licensed [gomarble-ai/facebook-ads-mcp-server](https://github.com/gomarble-ai/facebook-ads-mcp-server) (see `readme.md` for upstream docs), extended with page and Instagram tools.
+Open-source MCP server for **Facebook Ads management, Facebook Page monitoring, and Instagram monitoring** — built for [Tapmad](https://www.tapmad.com). Fork of the MIT-licensed [gomarble-ai/facebook-ads-mcp-server](https://github.com/gomarble-ai/facebook-ads-mcp-server), extended with page and Instagram tools.
 
 ## Tools (31)
 
