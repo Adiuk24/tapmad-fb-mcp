@@ -74,4 +74,4 @@ Notes on Meta API limits (not bugs):
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Upstream copyright gomarble-ai.
+MIT — see [LICENSE](LICENSE). Tapmad's extensions are © Tapmad; the file also retains the copyright notice of [gomarble-ai's server](https://github.com/gomarble-ai/facebook-ads-mcp-server) this project started from, which the MIT license requires.

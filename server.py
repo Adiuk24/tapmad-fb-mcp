@@ -21,7 +21,7 @@ DEFAULT_AD_ACCOUNT_FIELDS = [
 ]
 
 # Create an MCP server
-mcp = FastMCP("fb-api-mcp-server")
+mcp = FastMCP("tapmad-fb-mcp")
 
 # Add a global variable to store the token
 FB_ACCESS_TOKEN = None

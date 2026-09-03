@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "Tapmad social MCP server: Meta Ads, Facebook Page and Instagram monitoring for Claude Code"
 readme = "README.md"
 license = { file = "LICENSE" }
+authors = [{ name = "Tapmad" }]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.6.0,<2",
