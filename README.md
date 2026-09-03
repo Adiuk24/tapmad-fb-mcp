@@ -61,11 +61,7 @@ All read-only. The token carries reporting scopes only — it cannot post, edit 
 
 Team rules that keep it working are on the sheet's **📖 Read Me First** tab. The short version: paste the exact caption you post, and never hand-edit the robot's metric columns.
 
-To run it manually:
-
-```bash
-COMPOSIO_API_KEY=... COMPOSIO_USER_ID=... FB_ACCESS_TOKEN=... SHEET_ID=... python3 daily_report.py
-```
+The report runs itself — nobody on the team needs to run it. If the sheet looks stale, tell Arif.
 
 ## About the token
 
