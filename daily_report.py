@@ -127,15 +127,16 @@ def fetch_views(ids, tok):
     return VIEWS
 
 REACH = {}
+WATCH = {}       # post_id -> avg time watched (ms)
+MEDIA_TYPE = {}  # post_id -> video | photo | album | share ...
+VID_OF = {}      # post_id -> video id
 
-def fetch_reach(ids, tok):
-    """post_impressions_unique (reach) lives on /{video_id}/video_insights in v22 —
-    the post-level insights edge rejects it. Two batched hops: post -> video id -> reach."""
-    todo = [i for i in dict.fromkeys(ids) if i and i not in REACH]
-    vid_of = {}
+def fetch_media(ids, tok):
+    """Batch attachments: media type + video target id, cached."""
+    todo = [i for i in dict.fromkeys(ids) if i and i not in MEDIA_TYPE]
     for bi in range(0, len(todo), 50):
         chunk = todo[bi:bi + 50]
-        batch = json.dumps([{"method": "GET", "relative_url": f"{p}/attachments?fields=target"} for p in chunk])
+        batch = json.dumps([{"method": "GET", "relative_url": f"{p}/attachments?fields=media_type,target"} for p in chunk])
         body = urllib.parse.urlencode({"access_token": tok, "batch": batch}).encode()
         try:
             br = json.load(urllib.request.urlopen(
@@ -143,11 +144,20 @@ def fetch_reach(ids, tok):
             for pid, res in zip(chunk, br):
                 if res and res.get("code") == 200:
                     d = json.loads(res["body"]).get("data", [])
-                    t = (d[0].get("target") or {}).get("id") if d else None
-                    if t: vid_of[pid] = t
+                    if d:
+                        MEDIA_TYPE[pid] = d[0].get("media_type", "")
+                        t = (d[0].get("target") or {}).get("id")
+                        if t: VID_OF[pid] = t
+                    else:
+                        MEDIA_TYPE[pid] = "text"
         except Exception as e:
             print("attachments batch err:", e)
-    vids = list(vid_of.items())
+
+def fetch_reach(ids, tok):
+    """post_impressions_unique (reach) lives on /{video_id}/video_insights in v22 —
+    the post-level insights edge rejects it. Also captures avg watch time (ms)."""
+    fetch_media(ids, tok)
+    vids = [(p, VID_OF[p]) for p in dict.fromkeys(ids) if p in VID_OF and p not in REACH]
     for bi in range(0, len(vids), 50):
         chunk = vids[bi:bi + 50]
         # v22 quirk: post_impressions_unique is rejected as an explicit metric but
@@ -161,8 +171,11 @@ def fetch_reach(ids, tok):
             for (pid, _), res in zip(chunk, br):
                 if res and res.get("code") == 200:
                     for m in json.loads(res["body"]).get("data", []):
-                        if m.get("name") == "post_impressions_unique" and m.get("values"):
+                        if not m.get("values"): continue
+                        if m.get("name") == "post_impressions_unique":
                             REACH[pid] = m["values"][0].get("value")
+                        elif m.get("name") == "post_video_avg_time_watched":
+                            WATCH[pid] = m["values"][0].get("value")
         except Exception as e:
             print("video_insights batch err:", e)
     return REACH
@@ -294,7 +307,7 @@ def main():
         need = [p["id"] for p in month_posts if is_hl(p.get("message") or "") or is_ent(p.get("message") or "")]
         pviews = fetch_views(need, tok)
         preach = fetch_reach(need, tok)
-        HDR = ["Date", "Match / Title", "Caption", "Link", "Views", "Reach", "Reactions", "Comments", "Shares", "In content calendar?"]
+        HDR = ["Date", "Match / Title", "Caption", "Link", "Views", "Reach", "Reactions", "Comments", "Shares", "Avg watch (s)", "In content calendar?"]
         for sect, pred in [(f"Highlights {label}", is_hl), (f"Entertainment {label}", is_ent)]:
             sel = sorted([p for p in month_posts if pred(p.get("message") or "")], key=lambda p: p["created_time"])
             rows_ = []
@@ -303,23 +316,48 @@ def main():
                 n = norm(m)
                 v = pviews.get(p["id"]); v = v if v is not None else "No data"
                 rch = preach.get(p["id"]); rch = rch if rch is not None else "No data"
+                w = WATCH.get(p["id"]); w = round(w / 1000, 1) if w is not None else "No data"
                 rows_.append([p["created_time"][:10], mname(m), m[:80].replace("\n", " "),
                               p.get("permalink_url", ""), v, rch,
                               p.get("reactions", {}).get("summary", {}).get("total_count", 0),
                               p.get("comments", {}).get("summary", {}).get("total_count", 0),
-                              (p.get("shares") or {}).get("count", 0),
+                              (p.get("shares") or {}).get("count", 0), w,
                               "Yes" if (n[:40] in capkeys or n[:25] in capkeys) else "NOT IN CALENDAR"])
+            watches = [r[9] for r in rows_ if isinstance(r[9], (int, float))]
             tot = ["TOTAL", "", "", "", sum(r[4] for r in rows_ if isinstance(r[4], int)) or "No data",
                    sum(r[5] for r in rows_ if isinstance(r[5], int)) or "No data",
                    sum(r[6] for r in rows_), sum(r[7] for r in rows_), sum(r[8] for r in rows_),
-                   f"{sum(1 for r in rows_ if r[9] == 'Yes')}/{len(rows_)} in calendar"]
+                   round(sum(watches) / len(watches), 1) if watches else "No data",
+                   f"{sum(1 for r in rows_ if r[10] == 'Yes')}/{len(rows_)} in calendar"]
             try:
-                composio("GOOGLESHEETS_CLEAR_VALUES", {"spreadsheet_id": SID, "range": f"{sect}!A2:J800"})
+                composio("GOOGLESHEETS_CLEAR_VALUES", {"spreadsheet_id": SID, "range": f"{sect}!A2:K800"})
                 composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": sect,
                     "first_cell_location": "A1", "valueInputOption": "USER_ENTERED", "values": [HDR] + rows_ + [tot]})
                 print(f"{sect}: {len(rows_)} rows rebuilt")
             except Exception as e:
                 print(f"{sect}: SKIPPED — {str(e)[:100]} (create the tab for the new month)")
+
+        # format performance split: video vs static, whole month
+        fetch_media([p["id"] for p in month_posts], tok)
+        vidp = [p for p in month_posts if MEDIA_TYPE.get(p["id"]) == "video"]
+        statp = [p for p in month_posts if MEDIA_TYPE.get(p["id"]) in ("photo", "album")]
+        def _avg_rx(L):
+            return round(sum(p.get("reactions", {}).get("summary", {}).get("total_count", 0) for p in L) / len(L), 1) if L else 0
+        av, ast_ = _avg_rx(vidp), _avg_rx(statp)
+        edge = f"{round(av / ast_, 1)}x video" if ast_ else "n/a"
+        composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "\U0001F4CA Dashboard",
+            "first_cell_location": "P8", "valueInputOption": "USER_ENTERED", "values": [
+            [f"FORMAT — {label.upper()}", ""],
+            ["Video / reels", f"{len(vidp)} posts · avg {av} rx"],
+            ["Static / photo", f"{len(statp)} posts · avg {ast_} rx"],
+            ["Engagement edge", edge]]})
+        print(f"format split: video {len(vidp)} (avg {av} rx) vs static {len(statp)} (avg {ast_} rx)")
+
+    # 3.5 Instagram stories log (runs every pass — stories vanish after 24h)
+    try:
+        update_stories()
+    except Exception as e:
+        print("stories log err:", str(e)[:120])
 
     # 3. daily KPIs -> Dashboard (skip if today already logged)
     log = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID, "ranges": ["📊 Dashboard!A23:A400"]})
@@ -352,6 +390,54 @@ def main():
     composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
         "first_cell_location": f"A{nextrow}", "valueInputOption": "USER_ENTERED", "values": [row]})
     print(f"dashboard: appended {today} at row {nextrow}")
+
+STORIES_TAB = "Stories Log"
+
+def ensure_tab(title, header):
+    d = composio("GOOGLESHEETS_GET_SHEET_NAMES", {"spreadsheet_id": SID})
+    names = (d.get("response_data") or d).get("sheet_names") or []
+    if title in names: return
+    r = composio("GOOGLESHEETS_ADD_SHEET", {"spreadsheet_id": SID})
+    sid_ = r["replies"][0]["addSheet"]["sheetId"]
+    composio("GOOGLESHEETS_UPDATE_SHEET_PROPERTIES", {"spreadsheetId": SID,
+        "updateSheetProperties": {"properties": {"sheetId": sid_, "title": title}, "fields": "title"}})
+    composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": title,
+        "first_cell_location": "A1", "valueInputOption": "USER_ENTERED", "values": [header]})
+
+def update_stories():
+    """Log IG stories before they expire (24h); refresh metrics while active."""
+    ensure_tab(STORIES_TAB, ["Date", "Platform", "Type", "Posted (UTC)", "Story ID",
+                             "Views", "Reach", "Replies", "Interactions", "Note"])
+    r = graph(f"{IG}/stories", FBTOK, fields="id,media_type,timestamp")
+    if "error" in r:
+        print("stories: IG token issue —", str(r["error"].get("message"))[:60]); return
+    active = r.get("data", [])
+    got = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID, "ranges": [f"{STORIES_TAB}!E2:E1000"]})
+    ids = [(row[0] if row else "") for row in ((got.get("valueRanges") or [{}])[0].get("values") or [])]
+    rowof = {v: i + 2 for i, v in enumerate(ids) if v}
+    nextrow = 2 + len(ids)
+    for st in active:
+        met = {"views": "", "reach": "", "replies": "", "total_interactions": ""}
+        note = ""
+        ins = graph(f"{st['id']}/insights", FBTOK, metric="views,reach,replies,total_interactions")
+        if "data" in ins:
+            for m in ins["data"]:
+                if m.get("values"): met[m["name"]] = m["values"][0].get("value")
+        else:
+            emsg = str(ins.get("error", {}).get("message", ""))
+            note = "Low viewers" if "Not enough viewers" in emsg else emsg[:40]
+        vals = [st["timestamp"][:10], "Instagram", st.get("media_type", ""), st.get("timestamp", "")[:16],
+                st["id"], met["views"], met["reach"], met["replies"], met["total_interactions"], note]
+        target = rowof.get(st["id"])
+        if target:  # refresh metrics on existing row
+            composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": STORIES_TAB,
+                "first_cell_location": f"F{target}", "valueInputOption": "USER_ENTERED",
+                "values": [[met["views"], met["reach"], met["replies"], met["total_interactions"], note]]})
+        else:
+            composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": STORIES_TAB,
+                "first_cell_location": f"A{nextrow}", "valueInputOption": "USER_ENTERED", "values": [vals]})
+            rowof[st["id"]] = nextrow; nextrow += 1
+    print(f"stories: {len(active)} active logged/refreshed")
 
 def stamp():
     composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
