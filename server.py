@@ -2330,10 +2330,38 @@ def get_activities_by_adset(
 
 # --- Page monitoring tools (Tapmad addition) ---
 
+def _composio_page_token(page_id: str) -> Optional[str]:
+    """Optionally fetch a Page token via a Composio Facebook connection
+    (COMPOSIO_API_KEY + COMPOSIO_USER_ID env). Composio's Meta app has
+    advanced-access permissions (read_insights, pages_read_user_content),
+    so its Page tokens unlock insights and comments that a Graph API
+    Explorer user token cannot. Fetched fresh per process, never persisted."""
+    key, uid = os.environ.get("COMPOSIO_API_KEY"), os.environ.get("COMPOSIO_USER_ID")
+    if not (key and uid):
+        return None
+    if page_id in _COMPOSIO_PAGE_TOKENS:
+        return _COMPOSIO_PAGE_TOKENS[page_id]
+    try:
+        r = requests.post("https://backend.composio.dev/api/v3/tools/execute/FACEBOOK_GET_USER_PAGES",
+                          json={"user_id": uid, "arguments": {}},
+                          headers={"x-api-key": key}, timeout=30)
+        for p in r.json()["data"]["response_data"]["data"]:
+            if p.get("access_token"):
+                _COMPOSIO_PAGE_TOKENS[p["id"]] = p["access_token"]
+    except Exception:
+        pass
+    return _COMPOSIO_PAGE_TOKENS.get(page_id)
+
+_COMPOSIO_PAGE_TOKENS: Dict[str, str] = {}
+
 def _page_token(page_id: str) -> Optional[str]:
     """A Page's own edges (posts, insights) need a Page access token, not the
-    user token. Derive it from /me/accounts; fall back to the user token if
-    the page isn't listed (public reads still work)."""
+    user token. Prefer a Composio-issued token (stronger permissions), then
+    derive from /me/accounts; fall back to the user token if the page isn't
+    listed (public reads still work)."""
+    ct = _composio_page_token(page_id)
+    if ct:
+        return ct
     try:
         accounts = _fetch_edge('me', 'accounts', fields=['id', 'access_token'], limit=100)
         for acc in accounts.get('data', []):
