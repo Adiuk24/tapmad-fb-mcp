@@ -1,0 +1,28 @@
+name: tapmad social report
+
+# Replaces the local LaunchAgent so the report runs with the laptop closed.
+# ubuntu-latest ships Python 3.12 and daily_report.py is stdlib-only,
+# so there is nothing to install. Cron is UTC; with a +06 local offset and a
+# 6-hour interval these fire at the same 03/09/15/21 wall-clock times as before.
+on:
+  schedule:
+    - cron: "0 3,9,15,21 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tapmad-social-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run daily report
+        env:
+          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+          COMPOSIO_USER_ID: ${{ secrets.COMPOSIO_USER_ID }}
+          FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python3 -u daily_report.py

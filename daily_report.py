@@ -70,11 +70,25 @@ def page_token():
             return p["access_token"]
     return FBTOK
 
+def _get_json(req, timeout=60, tries=4):
+    """Retry transient network failures. An unattended cron run must not die on
+    one timed-out read: the 2026-09-04 03:00 run crashed on a Graph pagination
+    read timeout ~200 posts in. HTTPError is deliberately NOT retried — Facebook
+    returns real API errors as 4xx JSON bodies that callers parse for meaning."""
+    for attempt in range(tries):
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=timeout))
+        except urllib.error.HTTPError:
+            raise
+        except Exception:
+            if attempt == tries - 1: raise
+            time.sleep(5 * (attempt + 1))
+
 def graph(path, tok, **params):
     params["access_token"] = tok
     url = f"https://graph.facebook.com/v22.0/{path}?" + urllib.parse.urlencode(params)
     try:
-        return json.load(urllib.request.urlopen(url, timeout=60))
+        return _get_json(url)
     except urllib.error.HTTPError as e:
         return json.loads(e.read())
 
@@ -196,7 +210,7 @@ def main():
         posts.extend(r.get("data", []))
         nxt = (r.get("paging") or {}).get("next")
         if not nxt or len(posts) > 2000: break
-        r = json.load(urllib.request.urlopen(nxt, timeout=60))
+        r = _get_json(nxt)
     print(f"{tab}: {len(posts)} posts fetched")
 
     # 2. fill tracker metrics by caption match (header-aware)
