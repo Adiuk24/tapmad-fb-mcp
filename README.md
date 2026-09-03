@@ -2,7 +2,7 @@
 
 Open-source MCP server for **Facebook Ads management, Facebook Page monitoring, and Instagram monitoring** — built for [Tapmad](https://www.tapmad.com). Fork of the MIT-licensed [gomarble-ai/facebook-ads-mcp-server](https://github.com/gomarble-ai/facebook-ads-mcp-server), extended with page and Instagram tools.
 
-## Tools (31)
+## Tools (32)
 
 **Ads (21, from upstream):** ad accounts, campaigns, adsets, ads, insights at every level, creatives, activity logs, pagination.
 
@@ -15,6 +15,7 @@ Open-source MCP server for **Facebook Ads management, Facebook Page monitoring, 
 | `get_post_comments` | Comments on a post |
 | `get_page_insights` | Page engagement/follows/video-views/views metrics |
 | `get_post_insights` | Per-post clicks and reactions |
+| `get_page_ad_posts` | Ad creatives (dark posts) running for the Page |
 
 **Instagram (4, added):**
 | Tool | What it does |

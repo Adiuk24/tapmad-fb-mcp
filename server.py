@@ -2424,6 +2424,16 @@ def get_post_insights(post_id: str, metrics: Optional[List[str]] = None) -> Dict
     return _make_graph_api_call(url, params)
 
 
+@mcp.tool()
+def get_page_ad_posts(page_id: str, limit: int = 25) -> Dict:
+    """Get the Page's ad posts (including unpublished 'dark posts' used as ad
+    creatives). Works with page-level access even without a role on the ad
+    account that runs them. Requires pages_manage_ads."""
+    return _fetch_page_edge(page_id, 'ads_posts', fields=[
+        'id', 'created_time', 'message', 'permalink_url', 'is_published',
+        'attachments{title,description,type}'], limit=limit)
+
+
 # --- Instagram monitoring tools (via linked IG business accounts) ---
 
 @mcp.tool()
