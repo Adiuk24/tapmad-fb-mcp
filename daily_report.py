@@ -56,6 +56,14 @@ def composio(slug, args):
     raise RuntimeError(f"{slug}: retries exhausted")
 
 def page_token():
+    # system-user token (never expires) derives page tokens directly; Composio fallback
+    try:
+        r = graph("me/accounts", FBTOK, fields="id,access_token", limit=100)
+        for p in r.get("data", []):
+            if p["id"] == PAGE and p.get("access_token"):
+                return p["access_token"]
+    except Exception:
+        pass
     d = composio("FACEBOOK_GET_USER_PAGES", {})
     for p in (d.get("response_data") or d).get("data", []):
         if p["id"] == PAGE and p.get("access_token"):

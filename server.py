@@ -2499,6 +2499,11 @@ def get_instagram_insights(ig_user_id: str, metrics: Optional[List[str]] = None,
     return _fetch_edge(ig_user_id, 'insights', **kwargs)
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point: `tapmad-fb-mcp` (installed via pip/uvx)."""
     _get_fb_access_token()
     mcp.run(transport='stdio')
+
+
+if __name__ == "__main__":
+    main()
