@@ -126,6 +126,47 @@ def fetch_views(ids, tok):
             print("views batch err:", e)
     return VIEWS
 
+REACH = {}
+
+def fetch_reach(ids, tok):
+    """post_impressions_unique (reach) lives on /{video_id}/video_insights in v22 —
+    the post-level insights edge rejects it. Two batched hops: post -> video id -> reach."""
+    todo = [i for i in dict.fromkeys(ids) if i and i not in REACH]
+    vid_of = {}
+    for bi in range(0, len(todo), 50):
+        chunk = todo[bi:bi + 50]
+        batch = json.dumps([{"method": "GET", "relative_url": f"{p}/attachments?fields=target"} for p in chunk])
+        body = urllib.parse.urlencode({"access_token": tok, "batch": batch}).encode()
+        try:
+            br = json.load(urllib.request.urlopen(
+                urllib.request.Request("https://graph.facebook.com/v22.0", data=body), timeout=120))
+            for pid, res in zip(chunk, br):
+                if res and res.get("code") == 200:
+                    d = json.loads(res["body"]).get("data", [])
+                    t = (d[0].get("target") or {}).get("id") if d else None
+                    if t: vid_of[pid] = t
+        except Exception as e:
+            print("attachments batch err:", e)
+    vids = list(vid_of.items())
+    for bi in range(0, len(vids), 50):
+        chunk = vids[bi:bi + 50]
+        # v22 quirk: post_impressions_unique is rejected as an explicit metric but
+        # is included in the default (unfiltered) video_insights response
+        batch = json.dumps([{"method": "GET",
+            "relative_url": f"{v}/video_insights"} for _, v in chunk])
+        body = urllib.parse.urlencode({"access_token": tok, "batch": batch}).encode()
+        try:
+            br = json.load(urllib.request.urlopen(
+                urllib.request.Request("https://graph.facebook.com/v22.0", data=body), timeout=120))
+            for (pid, _), res in zip(chunk, br):
+                if res and res.get("code") == 200:
+                    for m in json.loads(res["body"]).get("data", []):
+                        if m.get("name") == "post_impressions_unique" and m.get("values"):
+                            REACH[pid] = m["values"][0].get("value")
+        except Exception as e:
+            print("video_insights batch err:", e)
+    return REACH
+
 def main():
     today = datetime.date.today()
     tab = today.strftime("%B %Y")
@@ -252,6 +293,7 @@ def main():
         # batch views for this month's HL/Ent posts
         need = [p["id"] for p in month_posts if is_hl(p.get("message") or "") or is_ent(p.get("message") or "")]
         pviews = fetch_views(need, tok)
+        preach = fetch_reach(need, tok)
         HDR = ["Date", "Match / Title", "Caption", "Link", "Views", "Reach", "Reactions", "Comments", "Shares", "In content calendar?"]
         for sect, pred in [(f"Highlights {label}", is_hl), (f"Entertainment {label}", is_ent)]:
             sel = sorted([p for p in month_posts if pred(p.get("message") or "")], key=lambda p: p["created_time"])
@@ -260,13 +302,15 @@ def main():
                 m = p.get("message") or ""
                 n = norm(m)
                 v = pviews.get(p["id"]); v = v if v is not None else "No data"
+                rch = preach.get(p["id"]); rch = rch if rch is not None else "No data"
                 rows_.append([p["created_time"][:10], mname(m), m[:80].replace("\n", " "),
-                              p.get("permalink_url", ""), v, "No data",
+                              p.get("permalink_url", ""), v, rch,
                               p.get("reactions", {}).get("summary", {}).get("total_count", 0),
                               p.get("comments", {}).get("summary", {}).get("total_count", 0),
                               (p.get("shares") or {}).get("count", 0),
                               "Yes" if (n[:40] in capkeys or n[:25] in capkeys) else "NOT IN CALENDAR"])
-            tot = ["TOTAL", "", "", "", sum(r[4] for r in rows_ if isinstance(r[4], int)) or "No data", "No data",
+            tot = ["TOTAL", "", "", "", sum(r[4] for r in rows_ if isinstance(r[4], int)) or "No data",
+                   sum(r[5] for r in rows_ if isinstance(r[5], int)) or "No data",
                    sum(r[6] for r in rows_), sum(r[7] for r in rows_), sum(r[8] for r in rows_),
                    f"{sum(1 for r in rows_ if r[9] == 'Yes')}/{len(rows_)} in calendar"]
             try:
