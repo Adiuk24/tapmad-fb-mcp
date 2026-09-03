@@ -13,14 +13,16 @@ You need two things: **Claude Code** installed, and the **Tapmad access token** 
 Run this one command (replace `PASTE_TOKEN_HERE`):
 
 ```bash
-claude mcp add tapmad-fb --scope user --env FB_ACCESS_TOKEN=PASTE_TOKEN_HERE -- uvx --from git+https://github.com/Adiuk24/tapmad-fb-mcp tapmad-fb-mcp
+claude mcp add tapmad-fb --scope user \
+  --env FB_ACCESS_TOKEN=PASTE_TOKEN_HERE \
+  -- uvx --from git+https://github.com/Adiuk24/tapmad-fb-mcp tapmad-fb-mcp
 ```
 
 That's it. Open a new Claude Code session and try:
 
-> "Show me this week's Tapmad Facebook posts sorted by reactions"
-> "What's tapmad.bd's Instagram reach this week?"
-> "Summarize the comments on our latest reel"
+- *"Show me this week's Tapmad Facebook posts sorted by reactions"*
+- *"What's tapmad.bd's Instagram reach this week?"*
+- *"Summarize the comments on our latest reel"*
 
 <details>
 <summary>No <code>uv</code>? Install it first (or use pip instead)</summary>
