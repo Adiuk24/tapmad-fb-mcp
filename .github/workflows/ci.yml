@@ -19,8 +19,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # These two must stay runnable with no dependencies installed: the
-      # scheduled report runs on a bare runner and imports tiktok.py directly.
+      # Pinned rather than relying on the image default: the scheduled report
+      # runs on `python3` here too, so the version it is tested against should
+      # not drift silently with the runner image. Also gives pip a writable
+      # environment — the system python3 is externally managed (PEP 668).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # These two run before anything is installed, on purpose: that is what
+      # proves they are still stdlib-only. The scheduled report runs on a bare
+      # runner and imports tiktok.py directly, so a new third-party import in
+      # either file would break it in production and nowhere else.
       - name: Selftests (stdlib only — proves no dependency crept in)
         run: |
           python3 tiktok.py --selftest
@@ -28,7 +38,7 @@ jobs:
 
       - name: Build wheel
         run: |
-          pip install --quiet build
+          python -m pip install --quiet --upgrade build
           python -m build --wheel
 
       - name: Installed wheel must import
@@ -37,7 +47,7 @@ jobs:
         # pass even when they are absent from the wheel — which is exactly the
         # bug this step exists to catch.
         run: |
-          pip install --quiet dist/*.whl
+          python -m pip install --quiet dist/*.whl
           cd /tmp
           FB_ACCESS_TOKEN=dummy python -c "
           import asyncio, server, tiktok
