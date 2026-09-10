@@ -6,6 +6,7 @@ import json
 import requests
 import os
 import sys
+import time
 from urllib.parse import urlsplit
 
     
@@ -2499,6 +2500,81 @@ def get_instagram_insights(ig_user_id: str, metrics: Optional[List[str]] = None,
     return _fetch_edge(ig_user_id, 'insights', **kwargs)
 
 
+# --- TikTok Business Account tools (Organic Accounts API v1.3) ---
+#
+# The client, the credential handling and the ~24h token refresh all live in
+# tiktok.py, which is stdlib-only so daily_report.py can import it on a bare
+# CI runner. These are thin MCP wrappers over it — keep them thin, and keep the
+# refresh logic in one place.
+
+import tiktok as _tt
+
+
+@mcp.tool()
+def get_tiktok_account(business_id: Optional[str] = None,
+                       fields: Optional[List[str]] = None,
+                       start_date: Optional[str] = None,
+                       end_date: Optional[str] = None) -> Dict:
+    """Get a TikTok Business Account's profile and aggregate metrics
+    (followers_count, video_views, profile_views, likes, comments, shares,
+    audience breakdowns). business_id defaults to TIKTOK_BUSINESS_ID.
+    start_date/end_date are YYYY-MM-DD and scope the metric window; omit them
+    for lifetime figures. TikTok's own analytics warn data can lag up to 5
+    days, so the most recent days are provisional."""
+    return _tt.account(business_id, fields, start_date, end_date)
+
+
+@mcp.tool()
+def get_tiktok_videos(business_id: Optional[str] = None,
+                      fields: Optional[List[str]] = None,
+                      max_count: int = 20,
+                      cursor: Optional[int] = None,
+                      filters: Optional[Dict[str, Any]] = None) -> Dict:
+    """List a TikTok Business Account's posts with per-video metrics (views,
+    likes, comments, shares, reach, watch time, impression sources).
+    max_count is capped at 20 by TikTok; page with the `cursor` in the
+    response. `filters` is passed through as JSON for date-range filtering."""
+    return _tt.videos(business_id, fields, max_count, cursor, filters)
+
+
+@mcp.tool()
+def get_tiktok_video_comments(video_id: str, business_id: Optional[str] = None,
+                              max_count: int = 20, cursor: Optional[int] = None,
+                              include_replies: bool = False) -> Dict:
+    """Get comments on one TikTok video. video_id is the `item_id` from
+    get_tiktok_videos. max_count is capped at 20 by TikTok."""
+    return _tt.video_comments(video_id, business_id, max_count, cursor, include_replies)
+
+
+@mcp.tool()
+def tiktok_exchange_auth_code(auth_code: str, redirect_uri: str,
+                              client_id: Optional[str] = None,
+                              client_secret: Optional[str] = None) -> Dict:
+    """Exchange the auth_code from the TikTok authorization callback for tokens
+    plus the account id the other TikTok tools need.
+
+    Run this ONCE. It saves the access and refresh tokens to the local cache
+    (0600), after which reads renew themselves — no token gets pasted into
+    config or rotated by hand. Secrets are stored, not returned."""
+    data = _tt.exchange_code(auth_code, redirect_uri, client_id, client_secret)
+    return {k: v for k, v in data.items()
+            if k not in ('access_token', 'refresh_token')} | {
+        'saved_to': _tt.TOKEN_FILE,
+        'note': 'access_token and refresh_token were saved locally (0600), not returned.'}
+
+
+@mcp.tool()
+def tiktok_refresh_access_token(refresh_token: Optional[str] = None,
+                                client_id: Optional[str] = None,
+                                client_secret: Optional[str] = None) -> Dict:
+    """Force a TikTok token renewal now. Not normally needed — reads refresh
+    themselves. Useful to check the stored refresh token still works."""
+    saved = _tt.refresh(refresh_token, client_id, client_secret)
+    return {'expires_at': saved['expires_at'],
+            'expires_in_hours': round((saved['expires_at'] - time.time()) / 3600, 1),
+            'saved_to': _tt.TOKEN_FILE}
+
+
 def main():
     """Console entry point: `tapmad-fb-mcp` (installed via pip/uvx)."""
     _get_fb_access_token()
@@ -2506,4 +2582,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--selftest-tiktok" in sys.argv:
+        _tt.selftest()
+        sys.exit(0)
     main()
