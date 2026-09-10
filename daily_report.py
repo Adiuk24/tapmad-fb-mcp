@@ -70,16 +70,36 @@ def page_token():
             return p["access_token"]
     return FBTOK
 
+def _get_json(req, timeout=60, tries=4):
+    """Retry transient network failures. An unattended cron run must not die on
+    one timed-out read: the 2026-09-04 03:00 run crashed on a Graph pagination
+    read timeout ~200 posts in. HTTPError is deliberately NOT retried — Facebook
+    returns real API errors as 4xx JSON bodies that callers parse for meaning."""
+    for attempt in range(tries):
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=timeout))
+        except urllib.error.HTTPError:
+            raise
+        except Exception:
+            if attempt == tries - 1: raise
+            time.sleep(5 * (attempt + 1))
+
 def graph(path, tok, **params):
     params["access_token"] = tok
     url = f"https://graph.facebook.com/v22.0/{path}?" + urllib.parse.urlencode(params)
     try:
-        return json.load(urllib.request.urlopen(url, timeout=60))
+        return _get_json(url)
     except urllib.error.HTTPError as e:
         return json.loads(e.read())
 
 def norm(s):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", s or "")).strip().lower()
+
+# " [row 4, 9, 12 +3 more]" — the feedback panel names the rows to fix, not just a count.
+def rowlist(rows, cap=8):
+    if not rows: return ""
+    more = f" +{len(rows) - cap} more" if len(rows) > cap else ""
+    return f" [row {', '.join(str(r) for r in rows[:cap])}{more}]"
 
 # post_id -> video views. Reach is NOT here on purpose: post_impressions,
 # post_impressions_unique, post_engaged_users and post_activity are all rejected by
@@ -196,7 +216,7 @@ def main():
         posts.extend(r.get("data", []))
         nxt = (r.get("paging") or {}).get("next")
         if not nxt or len(posts) > 2000: break
-        r = json.load(urllib.request.urlopen(nxt, timeout=60))
+        r = _get_json(nxt)
     print(f"{tab}: {len(posts)} posts fetched")
 
     # 2. fill tracker metrics by caption match (header-aware)
@@ -261,18 +281,19 @@ def main():
         print(f"tracker: {filled} rows matched and updated (cols {Lc})")
 
         # team feedback: what the robot could not do, and why
-        no_caption = sum(1 for i in range(len(content))
-                         if content[i].strip() and not (caps[i].strip() if i < len(caps) else ""))
-        done_unmatched = sum(1 for i in range(len(status))
-                             if status[i].strip() == "Done"
-                             and not (links[i][0] if i < len(links) else ""))
-        pending = sum(1 for i in range(len(caps))
-                      if caps[i].strip() and (approval[i].strip() if i < len(approval) else "") != "Complete")
-        fb1 = (f"⚠ {no_caption} rows have content but NO caption — robot can't attach metrics (Rule 1)"
-               if no_caption else "✓ All content rows have captions")
-        fb2 = (f"⚠ {done_unmatched} rows marked Done but no FB post found — fix caption or paste the link (Rule 2)"
-               if done_unmatched else "✓ Every Done row is matched to a live FB post")
-        fb3 = f"◔ {pending} captioned rows still waiting for brand approval" if pending else "✓ No approvals pending"
+        no_caption = [i + 2 for i in range(len(content))
+                      if content[i].strip() and not (caps[i].strip() if i < len(caps) else "")]
+        done_unmatched = [i + 2 for i in range(len(status))
+                          if status[i].strip() == "Done"
+                          and not (links[i][0] if i < len(links) else "")]
+        pending = [i + 2 for i in range(len(caps))
+                   if caps[i].strip() and (approval[i].strip() if i < len(approval) else "") != "Complete"]
+        fb1 = (f"⚠ {len(no_caption)} rows have content but NO caption — robot can't attach metrics (Rule 1)"
+               f"{rowlist(no_caption)}" if no_caption else "✓ All content rows have captions")
+        fb2 = (f"⚠ {len(done_unmatched)} rows marked Done but no FB post found — fix caption or paste the link (Rule 2)"
+               f"{rowlist(done_unmatched)}" if done_unmatched else "✓ Every Done row is matched to a live FB post")
+        fb3 = (f"◔ {len(pending)} captioned rows still waiting for brand approval"
+               if pending else "✓ No approvals pending")
         composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
             "first_cell_location": "J5", "valueInputOption": "RAW",
             "values": [[f"Last check: {str(datetime.datetime.now())[:16]} — {fb3}"], [fb1], [fb2]]})
@@ -353,17 +374,21 @@ def main():
             ["Engagement edge", edge]]})
         print(f"format split: video {len(vidp)} (avg {av} rx) vs static {len(statp)} (avg {ast_} rx)")
 
+        # TikTok: own tab + own panel, matched against the same planned captions
+        update_tiktok(today, capkeys)
+
     # 3.5 Instagram stories log (runs every pass — stories vanish after 24h)
     try:
         update_stories()
     except Exception as e:
         print("stories log err:", str(e)[:120])
 
-    # 3. daily KPIs -> Dashboard (skip if today already logged)
+    # 3. daily KPIs -> Dashboard (skip the append if today already logged)
     log = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID, "ranges": ["📊 Dashboard!A23:A400"]})
     dates = [row[0] for row in ((log.get("valueRanges") or [{}])[0].get("values") or []) if row]
     if str(today) in dates:
-        print("dashboard: today already logged"); return
+        print("dashboard: today already logged")
+        fill_growth(22 + len(dates)); return
     nextrow = 23 + len(dates)
     yest = today - datetime.timedelta(days=1)
     ins = graph(f"{PAGE}/insights", tok, metric="page_post_engagements,page_follows,page_video_views,page_views_total",
@@ -384,12 +409,167 @@ def main():
         ig24 = sum(1 for m in igm.get("data", []) if (m.get("timestamp") or "") >= f"{yest}T00:00:00")
         iga = graph(IG, FBTOK, fields="followers_count")
         ig_followers = iga.get("followers_count", "No data")
-    row = [str(today), det.get("followers_count", ""), ig_followers,
-           met.get("page_post_engagements", ""), met.get("page_video_views", ""), met.get("page_views_total", ""),
-           len(p24), rx24, cm24, sh24, ig24, topmsg]
+    metrics = [det.get("followers_count", ""), ig_followers,
+               met.get("page_post_engagements", ""), met.get("page_video_views", ""),
+               met.get("page_views_total", "")]
+    row = ([str(today)]
+           + [v for i, m in enumerate(metrics) for v in (m, growth_cell(nextrow, i))]
+           + [len(p24), topmsg])
+    # reactions / comments tiles on the glance panel have no log column to INDEX from
+    composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
+        "first_cell_location": "G6", "valueInputOption": "RAW", "values": [[rx24, cm24]]})
     composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
         "first_cell_location": f"A{nextrow}", "valueInputOption": "USER_ENTERED", "values": [row]})
     print(f"dashboard: appended {today} at row {nextrow}")
+    fill_growth(nextrow)
+
+# Daily log layout: every metric is immediately followed by its own growth rate, so a
+# rate always sits beside the number it measures. Metric i is at column 1+2i, its
+# growth at 2+2i; date is A, top post is the last column. Keep in sync with `metrics`
+# in main() — the selftest asserts the two stay the same length.
+# Two other places read these columns by position and break if the order changes:
+# the Dashboard glance tiles + sparklines (rows 6-7, metric columns B,D,F,H,J,L) and
+# the FILTER blocks on the "📈 Charts" tab (rows 40+ / 430+) that feed its 6 charts.
+LOG_PAIRS = [("FB followers", "FB Growth rate"), ("IG followers", "IG Growth rate"),
+             ("FB engagements", "FB engagements growth"), ("FB video views", "FB video views growth"),
+             ("FB page views", "FB page views growth")]
+# Reactions / comments / shares / IG posts are NOT logged (removed 2026-09-06 as clutter —
+# the glance tiles G6:H6 get today's reactions/comments written directly instead).
+LOG_TAIL = ["FB posts 24h", "Top post"]
+LOG_HDR = ["Date"] + [h for pair in LOG_PAIRS for h in pair] + LOG_TAIL
+LOG_W = len(LOG_HDR)
+
+def growth_cell(r, i=0):
+    """Day-over-day growth of metric `i` as a real number (0.0019), so charts and the
+    glance tiles can consume it. A formula, not a computed value, so a hand-corrected
+    number re-derives its own rate. IFERROR blanks the cells with no base: row 23, a
+    zero yesterday, or a "No data" string from a dead token.
+
+    Display as a percent comes from the cell's number format, which the Sheets
+    connector cannot set directly (GOOGLESHEETS_FORMAT_CELL is fonts/colours only).
+    It was primed once by writing the literal "0.00%" to every growth column, rows
+    23-1000, then clearing the values — the format survives the clear and survives
+    every formula write after it. If growth ever shows as 0.0019 again, re-prime."""
+    c = col_letter(1 + 2 * i)
+    return f'=IFERROR(({c}{r}-{c}{r-1})/{c}{r-1},"")'
+
+def fill_growth(lastrow):
+    """Rewrite the header and every growth cell in one pass: read the logged metrics
+    back, regenerate the formulas around them, write the block once. Cheaper than one
+    call per column, and it repairs a rate that someone pasted over."""
+    composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
+        "first_cell_location": "A22", "valueInputOption": "RAW", "values": [LOG_HDR]})
+    if lastrow < 24:  # row 23 is the first day — nothing to compare against
+        print("growth: header only (need 2+ logged days)"); return
+    end = col_letter(LOG_W - 1)
+    got = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID,
+        "ranges": [f"📊 Dashboard!A23:{end}{lastrow}"]})
+    out = []
+    for n, raw in enumerate((got.get("valueRanges") or [{}])[0].get("values") or []):
+        r, row_no = (raw + [""] * LOG_W)[:LOG_W], 23 + n
+        out.append([r[0]] + [v for i in range(len(LOG_PAIRS))
+                             for v in (r[1 + 2 * i], growth_cell(row_no, i) if row_no > 23 else "")]
+                   + r[1 + 2 * len(LOG_PAIRS):LOG_W])
+    composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "📊 Dashboard",
+        "first_cell_location": "A23", "valueInputOption": "USER_ENTERED", "values": out})
+    print(f"growth: {len(LOG_PAIRS)} rates written for rows 24-{lastrow}")
+
+# --- TikTok (Organic Accounts API) ---
+#
+# Deliberately NOT added to LOG_PAIRS. The Dashboard glance tiles and their
+# sparklines INDEX the daily log by column position (B,D,F,H,J,L) and the
+# "📈 Charts" FILTER blocks do the same; inserting a sixth metric pair shifts
+# "FB posts 24h" from L to N and silently breaks a tile, a sparkline and a
+# chart, whose formulas live in the sheet rather than in this file. TikTok gets
+# its own monthly tab and its own Dashboard panel instead — same approach as
+# Stories Log — so nothing that already works has to move. Migrating the log to
+# six pairs is a separate job that has to rewrite those formulas too.
+
+TT_PANEL_CELL = "S5"          # free column block; A-Q are taken by other panels
+TT_HDR = ["Date", "Caption", "Link", "Views", "Reach", "Likes", "Comments",
+          "Shares", "Avg watch (s)", "Watched in full", "In content calendar?"]
+
+def _tiktok_api():
+    """tiktok.py owns the credentials and the ~24h token refresh. It is
+    stdlib-only so it imports on the bare CI runner this report runs on —
+    importing server.py here instead would need requests + mcp and the TikTok
+    section would skip on every scheduled run. Imported lazily so even a
+    missing file degrades this one section rather than killing the report."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tiktok
+    return tiktok
+
+def tt_date(v):
+    """create_time is a unix timestamp; tolerate an ISO string too."""
+    if v in (None, ""): return ""
+    if isinstance(v, (int, float)) or str(v).isdigit():
+        return datetime.datetime.fromtimestamp(
+            int(v), datetime.timezone.utc).strftime("%Y-%m-%d")
+    return str(v)[:10]
+
+def tt_rows(vids, capkeys, month_start):
+    rows = []
+    for v in vids:
+        if tt_date(v.get("create_time")) < month_start: continue
+        cap = (v.get("caption") or "").replace("\n", " ")
+        n = norm(cap)
+        w = v.get("average_time_watched")
+        rate = v.get("full_video_watched_rate")
+        rows.append([
+            tt_date(v.get("create_time")), cap[:80], v.get("share_url", ""),
+            v.get("video_views", "No data"), v.get("reach", "No data"),
+            v.get("likes", 0), v.get("comments", 0), v.get("shares", 0),
+            round(float(w) / 1000, 1) if w not in (None, "") else "No data",
+            f"{round(float(rate) * 100, 1)}%" if rate not in (None, "") else "No data",
+            "Yes" if (n[:40] in capkeys or n[:25] in capkeys) else "NOT IN CALENDAR"])
+    return sorted(rows, key=lambda r: r[0])
+
+def update_tiktok(today, capkeys):
+    """Rebuild this month's TikTok tab and refresh the Dashboard TikTok panel.
+    Writes an explicit 'not connected' note rather than zeros when the account
+    has no credentials yet — a zero here would read as 'TikTok posted nothing'."""
+    label = today.strftime("%b %Y")
+    sect = f"TikTok {label}"
+    try:
+        tt = _tiktok_api()
+        acct = tt.account() or {}
+        vids = tt.all_videos()
+    except Exception as e:
+        note = str(e).split("\n")[0][:150]
+        composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "\U0001F4CA Dashboard",
+            "first_cell_location": TT_PANEL_CELL, "valueInputOption": "RAW", "values": [
+            [f"TIKTOK — {label.upper()}", ""],
+            ["Status", "No data — TikTok not connected"],
+            ["Fix", "See TIKTOK_SETUP.md (one-time app + authorize)"],
+            ["Last error", note]]})
+        print("tiktok: SKIPPED —", note)
+        return
+
+    rows = tt_rows(vids, capkeys, str(today.replace(day=1)))
+    num = lambda i: sum(r[i] for r in rows if isinstance(r[i], (int, float)))
+    tot = ["TOTAL", "", "", num(3) or "No data", num(4) or "No data", num(5),
+           num(6), num(7), "", "",
+           f"{sum(1 for r in rows if r[10] == 'Yes')}/{len(rows)} in calendar"]
+    try:
+        ensure_tab(sect, TT_HDR)
+        composio("GOOGLESHEETS_CLEAR_VALUES", {"spreadsheet_id": SID, "range": f"{sect}!A2:K800"})
+        composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": sect,
+            "first_cell_location": "A1", "valueInputOption": "USER_ENTERED",
+            "values": [TT_HDR] + rows + [tot]})
+        print(f"{sect}: {len(rows)} rows rebuilt")
+    except Exception as e:
+        print(f"{sect}: tab write failed — {str(e)[:100]}")
+
+    composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "\U0001F4CA Dashboard",
+        "first_cell_location": TT_PANEL_CELL, "valueInputOption": "USER_ENTERED", "values": [
+        [f"TIKTOK — {label.upper()}", ""],
+        ["Followers", acct.get("followers_count", "No data")],
+        ["Profile views", acct.get("profile_views", "No data")],
+        ["Posts this month", len(rows)],
+        ["Views / likes", f"{num(3)} / {num(5)}"],
+        ["In calendar", tot[10]]]})
+    print(f"tiktok: {acct.get('followers_count','?')} followers, {len(rows)} posts this month")
+
 
 STORIES_TAB = "Stories Log"
 
@@ -459,6 +639,31 @@ def selftest():
     C2 = find_cols(octh)
     assert col_letter(C2["link"]) == "K" and col_letter(C2["caption"]) == "J", C2
     assert find_cols(["Day","Date"])["link"] is None
+    assert growth_cell(25, 0) == '=IFERROR((B25-B24)/B24,"")', growth_cell(25, 0)
+    assert growth_cell(25, 1).startswith("=IFERROR((D25-D24)"), growth_cell(25, 1)  # IG followers
+    assert growth_cell(25, 4).startswith("=IFERROR((J25-J24)"), growth_cell(25, 4)  # last paired metric
+    assert rowlist([]) == "" and rowlist([4, 9]) == " [row 4, 9]", rowlist([4, 9])
+    assert rowlist(list(range(2, 12))) == " [row 2, 3, 4, 5, 6, 7, 8, 9 +2 more]", rowlist(list(range(2, 12)))
+    # TikTok rows must line up with their header, and the calendar-match column
+    # must stay last — the TOTAL row and the panel both read row[10].
+    assert len(TT_HDR) == 11 and TT_HDR[10] == "In content calendar?", TT_HDR
+    assert tt_date(1788998400) == "2026-09-10", tt_date(1788998400)
+    assert tt_date("2026-09-10T06:57:24+0000") == "2026-09-10" and tt_date(None) == ""
+    _r = tt_rows([{"create_time": 1788998400, "caption": "Shanaka owns the stage",
+                   "video_views": 10, "likes": 2, "average_time_watched": 3500,
+                   "full_video_watched_rate": 0.42},
+                  {"create_time": 1787184000, "caption": "last month, must drop"}],
+                 {norm("Shanaka owns the stage")[:40]}, "2026-09-01")
+    assert len(_r) == 1, _r                       # the pre-month post is excluded
+    assert _r[0][10] == "Yes", _r                 # planned caption matches the tracker
+    assert _r[0][8] == 3.5 and _r[0][9] == "42.0%", _r
+    assert tt_rows([{"create_time": 1788998400, "caption": "ad hoc"}], set(), "2026-09-01")[0][10] \
+        == "NOT IN CALENDAR"
+    assert LOG_HDR[:3] == ["Date", "FB followers", "FB Growth rate"], LOG_HDR
+    assert LOG_HDR[-2:] == ["FB posts 24h", "Top post"] and LOG_W == 13, LOG_HDR
+    # every metric header must sit one column left of its own growth header
+    for i, (m, g) in enumerate(LOG_PAIRS):
+        assert LOG_HDR[1 + 2 * i] == m and LOG_HDR[2 + 2 * i] == g, (i, LOG_HDR)
     print("selftest OK")
 
 if __name__ == "__main__":
