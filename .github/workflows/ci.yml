@@ -1,0 +1,49 @@
+name: ci
+
+# Runs the selftests and — importantly — checks the built wheel actually
+# imports. Packaging is the failure mode with the widest blast radius here:
+# this is a flat-layout project, so hatchling ships only the modules listed in
+# pyproject, and a module missing from that list takes the whole MCP server
+# down on install (every tool, not just the new one). Nothing else in the repo
+# would catch it, because a local checkout always has the file on disk.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # These two must stay runnable with no dependencies installed: the
+      # scheduled report runs on a bare runner and imports tiktok.py directly.
+      - name: Selftests (stdlib only — proves no dependency crept in)
+        run: |
+          python3 tiktok.py --selftest
+          python3 daily_report.py --selftest
+
+      - name: Build wheel
+        run: |
+          pip install --quiet build
+          python -m build --wheel
+
+      - name: Installed wheel must import
+        # Run from outside the checkout on purpose. From the repo root, Python
+        # would import server.py and tiktok.py off the working directory and
+        # pass even when they are absent from the wheel — which is exactly the
+        # bug this step exists to catch.
+        run: |
+          pip install --quiet dist/*.whl
+          cd /tmp
+          FB_ACCESS_TOKEN=dummy python -c "
+          import asyncio, server, tiktok
+          tools = asyncio.run(server.mcp.list_tools())
+          assert len(tools) >= 37, f'expected 37+ tools, got {len(tools)}'
+          assert sum('tiktok' in t.name for t in tools) == 5, 'TikTok tools missing'
+          print(f'{len(tools)} tools importable from the installed wheel')
+          "
+          FB_ACCESS_TOKEN=dummy python -c "import server; server._tt.selftest()"

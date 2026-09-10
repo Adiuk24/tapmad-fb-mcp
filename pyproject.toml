@@ -1,7 +1,7 @@
 [project]
 name = "tapmad-fb-mcp"
-version = "1.0.0"
-description = "Tapmad social MCP server: Meta Ads, Facebook Page and Instagram monitoring for Claude Code"
+version = "1.1.0"
+description = "Tapmad social MCP server: Meta Ads, Facebook Page, Instagram and TikTok monitoring for Claude Code"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Tapmad" }]
@@ -18,9 +18,16 @@ tapmad-fb-mcp = "server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Every module server.py imports has to be listed here. This is a flat-layout
+# project, so hatchling ships only what it is told: tiktok.py was missing once
+# and `import tiktok` in server.py took the whole MCP down on install — all
+# tools, not just the TikTok ones. The "Installed wheel must import" job in
+# .github/workflows/ci.yml is what catches this; it deliberately runs from
+# outside the checkout, because a local copy on disk masks the bug.
 [tool.hatch.build.targets.wheel]
-include = ["server.py", "daily_report.py"]
+include = ["server.py", "daily_report.py", "tiktok.py"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "server.py" = "server.py"
 "daily_report.py" = "daily_report.py"
+"tiktok.py" = "tiktok.py"
