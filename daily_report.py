@@ -6,6 +6,7 @@ morning; safe to re-run (idempotent).
 Tokens come from the tapmad-fb MCP entry in ~/.claude.json.
 """
 import json, re, time, unicodedata, datetime, urllib.request, urllib.parse, sys, os
+from difflib import SequenceMatcher
 
 PAGE = "251041461420485"
 IG = "17841476533667147"
@@ -101,6 +102,35 @@ def graph(path, tok, **params):
 
 def norm(s):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", s or "")).strip().lower()
+
+def mkey(s):
+    """Caption match key. norm() alone compares the sheet against Facebook
+    character for character, so the two ways the team's copy legitimately drifts
+    both broke matching and left a posted row looking unposted:
+      - a leading quote typed into the cell ("La Liga-তে … vs La Liga-তে …)
+      - an emoji the CMS dropped on publish (আফগানিস্তানের ভারত সফর! 🔥 …)
+    Strip symbols and edge punctuation so those rows still land on their post."""
+    s = norm(s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "So" and ch not in "️‍")
+    return re.sub(r"\s+", " ", s).strip(" \"'“”‘’«»-—–:•.|")
+
+_FUZZ = 0.90
+
+def fuzzy_hit(cap, pkeys):
+    """Last resort for rows whose copy was edited after posting (a reworded
+    line, a dropped clause) — prefix matching cannot see those at all.
+
+    The cutoff is deliberately high. The calendar's unfilled template rows
+    ("[ম্যাচের ফলাফল ও হাইলাইট লিখুন]…") are ~0.74 similar to each other and to
+    any real post, so a looser bar would staple a live post's numbers onto an
+    empty planning row and show the brand a wrong result."""
+    k = mkey(cap)[:80]
+    if len(k) < 25: return None
+    best, score = None, 0.0
+    for p, pk in pkeys:
+        r = SequenceMatcher(None, k, pk).ratio()
+        if r > score: best, score = p, r
+    return best if score >= _FUZZ else None
 
 # " [row 4, 9, 12 +3 more]" — the feedback panel names the rows to fix, not just a count.
 def rowlist(rows, cap=8):
@@ -207,23 +237,61 @@ def fetch_reach(ids, tok):
             print("video_insights batch err:", e)
     return REACH
 
+POST_FIELDS = ("id,message,created_time,permalink_url,shares,"
+               "reactions.summary(total_count).limit(0),comments.summary(total_count).limit(0)")
+
+def _ts(iso):
+    """'2026-09-13T08:17:00+0000' -> unix seconds, for use as a Graph `until`."""
+    return int(datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S%z").timestamp())
+
+def fetch_posts(tok, since, until, limit=50, cap=3000):
+    """Every published post in [since, until], deduped by post id.
+
+    Facebook drops `paging.next` early under load. On 2026-09-14 the 18:03 run
+    stopped after 8 FULL pages (400 posts); the identical request at 19:24
+    walked all 18 pages (857). The old loop read a missing cursor as "end of
+    edge" and every tab downstream shrank with it — Highlights was cleared and
+    rebuilt with 59 of its 105 real rows, tracker rows lost their metrics.
+
+    So: a missing cursor after a full page is truncation, not the end. Resume
+    the walk from the oldest post in hand (`until` re-filters by created_time);
+    the id dedupe makes the overlapping post harmless. Only a SHORT page ends
+    the edge. If a resume fails to reach anything older, refuse — a partial
+    list must not reach the clear-and-rebuild writes."""
+    seen, posts, oldest = set(), [], None
+    q = dict(since=since, until=until, limit=limit, fields=POST_FIELDS)
+    r = graph(f"{PAGE}/published_posts", tok, **q)
+    resumes = 0
+    while True:
+        if "error" in r:
+            raise RuntimeError(f"published_posts: {str(r['error'])[:200]}")
+        d = r.get("data", [])
+        for p in d:
+            if p["id"] not in seen:
+                seen.add(p["id"]); posts.append(p)
+        nxt = (r.get("paging") or {}).get("next")
+        if len(posts) >= cap:
+            raise RuntimeError(f"published_posts: hit the {cap}-post cap — widen it or narrow the window")
+        if nxt:
+            r = _get_json(nxt); continue
+        if len(d) < limit or not posts:
+            return posts                      # short page: the edge really is done
+        prev, oldest = oldest, min(p["created_time"] for p in posts)
+        resumes += 1
+        if oldest == prev or resumes > 40:
+            raise RuntimeError(f"published_posts: truncated at {len(posts)} posts and cannot resume "
+                               f"past {oldest} — refusing to rebuild tabs from a partial month")
+        print(f"posts: cursor dropped after a full page at {len(posts)}, resuming from {oldest}")
+        r = graph(f"{PAGE}/published_posts", tok, **dict(q, until=_ts(oldest)))
+
 def main():
     today = datetime.date.today()
     tab = today.strftime("%B %Y")
     tok = page_token()
 
     # 1. fetch this month's posts with engagement
-    posts, url = [], f"{PAGE}/published_posts"
-    params = {"since": str(today.replace(day=1) - datetime.timedelta(days=3)),
-              "until": str(today + datetime.timedelta(days=1)),
-              "limit": 50, "fields": "id,message,created_time,permalink_url,shares,"
-              "reactions.summary(total_count).limit(0),comments.summary(total_count).limit(0)"}
-    r = graph(url, tok, **params)
-    while True:
-        posts.extend(r.get("data", []))
-        nxt = (r.get("paging") or {}).get("next")
-        if not nxt or len(posts) > 2000: break
-        r = _get_json(nxt)
+    posts = fetch_posts(tok, str(today.replace(day=1) - datetime.timedelta(days=3)),
+                        str(today + datetime.timedelta(days=1)))
     print(f"{tab}: {len(posts)} posts fetched")
 
     # 2. fill tracker metrics by caption match (header-aware)
@@ -232,8 +300,9 @@ def main():
         by_prefix = {}
         for p in posts:
             for L in (40, 25):
-                k = norm(p.get("message"))[:L]
+                k = mkey(p.get("message"))[:L]
                 if k: by_prefix.setdefault((L, k), []).append(p)
+        pkeys = [(p, mkey(p.get("message"))[:80]) for p in posts]
         hdr = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID, "ranges": [f"{tab}!A1:Z1"]})
         headers = ((hdr.get("valueRanges") or [{}])[0].get("values") or [[]])[0]
         C = find_cols(headers)
@@ -241,51 +310,54 @@ def main():
         if missing:
             raise RuntimeError(f"{tab}: headers not found for {missing} — column renamed? headers={headers}")
         Lc = {k: col_letter(v) for k, v in C.items() if v is not None}
+        keys = ["caption", "link", "content", "status", "approval", "rx", "cm"] + \
+               (["view"] if "view" in Lc else [])
         got = composio("GOOGLESHEETS_BATCH_GET", {"spreadsheet_id": SID,
-            "ranges": [f"{tab}!{Lc['caption']}2:{Lc['caption']}1000", f"{tab}!{Lc['link']}2:{Lc['link']}1000",
-                       f"{tab}!{Lc['content']}2:{Lc['content']}1000", f"{tab}!{Lc['status']}2:{Lc['status']}1000",
-                       f"{tab}!{Lc['approval']}2:{Lc['approval']}1000"]})
+            "ranges": [f"{tab}!{Lc[k]}2:{Lc[k]}1000" for k in keys]})
         vrs = got.get("valueRanges") or []
         col = lambda k: [row[0] if row else "" for row in (vrs[k].get("values") or [])]
         caps, curlink, content, status, approval = col(0), col(1), col(2), col(3), col(4)
+        currx, curcm = col(5), col(6)
+        curview = col(7) if "view" in Lc else []
+        keep = lambda c, i: c[i] if i < len(c) else ""
         n = max(len(caps), len(curlink), 1)
         links, rxs, cms = [], [], []
-        filled = 0
+        hitids, filled, refound = {}, 0, 0
         for i in range(n):
             cap = caps[i] if i < len(caps) else ""
             old = curlink[i] if i < len(curlink) else ""
             hit = None
             if cap and len(cap.strip()) >= 10:
                 for L in (40, 25):
-                    hs = by_prefix.get((L, norm(cap)[:L]), [])
+                    hs = by_prefix.get((L, mkey(cap)[:L]), [])
                     if hs:
                         hit = max(hs, key=lambda p: p.get("reactions", {}).get("summary", {}).get("total_count", 0))
                         break
+                if not hit:
+                    hit = fuzzy_hit(cap, pkeys)
+                    if hit: refound += 1
             if hit:
                 links.append([old or hit.get("permalink_url", "")])
                 rxs.append([hit.get("reactions", {}).get("summary", {}).get("total_count", 0)])
                 cms.append([hit.get("comments", {}).get("summary", {}).get("total_count", 0)])
+                hitids[i] = hit["id"]
                 filled += 1
             else:
-                links.append([old]); rxs.append([""]); cms.append([""])
+                # Keep what is already on the row. A row the matcher cannot place
+                # on this pass is normally one whose caption was edited after
+                # publishing, not one that was never posted — blanking it threw
+                # away a real posted result the team had already collected.
+                links.append([old]); rxs.append([keep(currx, i)]); cms.append([keep(curcm, i)])
         for letter, vals in [(Lc["link"], links), (Lc["rx"], rxs), (Lc["cm"], cms)]:
             composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": tab,
                 "first_cell_location": f"{letter}2", "valueInputOption": "USER_ENTERED", "values": vals})
         if C.get("view") is not None:
-            hitids = {}
-            for i in range(n):
-                cap = caps[i] if i < len(caps) else ""
-                if cap and len(cap.strip()) >= 10:
-                    for L in (40, 25):
-                        hs = by_prefix.get((L, norm(cap)[:L]), [])
-                        if hs:
-                            hitids[i] = max(hs, key=lambda p: p.get("reactions", {}).get("summary", {}).get("total_count", 0))["id"]
-                            break
             pv = fetch_views(list(hitids.values()), tok)
-            vw = [[pv.get(hitids[i], "No data") if i in hitids else ""] for i in range(n)]
+            vw = [[pv.get(hitids[i], "No data") if i in hitids else keep(curview, i)] for i in range(n)]
             composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": tab,
                 "first_cell_location": f"{Lc['view']}2", "valueInputOption": "USER_ENTERED", "values": vw})
-        print(f"tracker: {filled} rows matched and updated (cols {Lc})")
+        print(f"tracker: {filled} rows matched and updated "
+              f"({refound} rescued by fuzzy match) (cols {Lc})")
 
         # team feedback: what the robot could not do, and why
         no_caption = [i + 2 for i in range(len(content))
@@ -327,7 +399,7 @@ def main():
         capkeys = set()
         for c in caps:
             if c and len(c.strip()) >= 10:
-                n = norm(c); capkeys.add(n[:40]); capkeys.add(n[:25])
+                n = mkey(c); capkeys.add(n[:40]); capkeys.add(n[:25])
         month_start = str(today.replace(day=1))
         label = today.strftime("%b %Y")
         month_posts = [p for p in posts if p["created_time"][:10] >= month_start]
@@ -341,7 +413,7 @@ def main():
             rows_ = []
             for p in sel:
                 m = p.get("message") or ""
-                n = norm(m)
+                n = mkey(m)
                 v = pviews.get(p["id"]); v = v if v is not None else "No data"
                 rch = preach.get(p["id"]); rch = rch if rch is not None else "No data"
                 w = WATCH.get(p["id"]); w = round(w / 1000, 1) if w is not None else "No data"
@@ -506,6 +578,17 @@ def _tiktok_api():
     import tiktok
     return tiktok
 
+def compact_num(v):
+    """165400 -> '165.4K'. The profile blob reports these pre-rounded, so the
+    trailing digits are noise; showing them would imply a precision TikTok isn't
+    giving us. Passes through strings (the fallback path scrapes '165K')."""
+    if v in (None, ""): return "No data"
+    if isinstance(v, str): return v
+    for cut, suf in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(v) >= cut:
+            return f"{round(v / cut, 1):g}{suf}"
+    return v
+
 def tt_date(v):
     """create_time is a unix timestamp; tolerate an ISO string too."""
     if v in (None, ""): return ""
@@ -519,7 +602,7 @@ def tt_rows(vids, capkeys, month_start):
     for v in vids:
         if tt_date(v.get("create_time")) < month_start: continue
         cap = (v.get("caption") or "").replace("\n", " ")
-        n = norm(cap)
+        n = mkey(cap)
         w = v.get("average_time_watched")
         rate = v.get("full_video_watched_rate")
         rows.append([
@@ -537,10 +620,30 @@ def update_tiktok(today, capkeys):
     has no credentials yet — a zero here would read as 'TikTok posted nothing'."""
     label = today.strftime("%b %Y")
     sect = f"TikTok {label}"
+    src = "API"
     try:
-        tt = _tiktok_api()
-        acct = tt.account() or {}
-        vids = tt.all_videos()
+        scraped = os.environ.get("TIKTOK_JSON")
+        if scraped and os.path.exists(scraped):
+            # Chrome fallback while the Organic Accounts API application is
+            # pending: TikTok signs its web API calls, so a logged-in browser
+            # tab is the only thing that can read these. tiktok_scrape.js fills
+            # everything except reach / avg watch / watched-in-full, which cost
+            # one page load per video. See TIKTOK_SETUP.md.
+            with open(scraped, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("status") != "ok":
+                raise RuntimeError(f"scrape failed: {str(d.get('error'))[:100]}")
+            acct, vids = d.get("account") or {}, d.get("videos") or []
+            # A scrape that came back empty means the browser pass went wrong,
+            # not that nothing was posted. Bail before the CLEAR_VALUES below
+            # turns that into an erased month.
+            if not vids:
+                raise RuntimeError("scrape returned 0 videos — refusing to clear the tab")
+            src = "Chrome scrape" + ("" if d.get("complete") else " (PARTIAL — scroll stalled)")
+        else:
+            tt = _tiktok_api()
+            acct = tt.account() or {}
+            vids = tt.all_videos()
     except Exception as e:
         note = str(e).split("\n")[0][:150]
         composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "\U0001F4CA Dashboard",
@@ -569,8 +672,11 @@ def update_tiktok(today, capkeys):
 
     composio("GOOGLESHEETS_BATCH_UPDATE", {"spreadsheet_id": SID, "sheet_name": "\U0001F4CA Dashboard",
         "first_cell_location": TT_PANEL_CELL, "valueInputOption": "USER_ENTERED", "values": [
-        [f"TIKTOK — {label.upper()}", ""],
-        ["Followers", acct.get("followers_count", "No data")],
+        # Source goes in the header's spare cell rather than its own row, to keep
+        # the panel short; S/T are empty below it, so the one extra row is safe.
+        [f"TIKTOK — {label.upper()}", src],
+        ["Followers", compact_num(acct.get("followers_count"))],
+        ["Total likes", compact_num(acct.get("total_likes"))],
         ["Profile views", acct.get("profile_views", "No data")],
         ["Posts this month", len(rows)],
         ["Views / likes", f"{num(3)} / {num(5)}"],
@@ -651,6 +757,49 @@ def selftest():
     assert growth_cell(25, 4).startswith("=IFERROR((J25-J24)"), growth_cell(25, 4)  # last paired metric
     assert rowlist([]) == "" and rowlist([4, 9]) == " [row 4, 9]", rowlist([4, 9])
     assert rowlist(list(range(2, 12))) == " [row 2, 3, 4, 5, 6, 7, 8, 9 +2 more]", rowlist(list(range(2, 12)))
+    assert _ts("2026-09-13T08:17:00+0000") == 1789287420, _ts("2026-09-13T08:17:00+0000")
+    # Caption drift between the sheet and the published post: the two shapes seen
+    # in September (a typed leading quote, an emoji dropped on publish) must
+    # produce the SAME key, or a posted row reads as never posted.
+    assert mkey('"La Liga-তে আবারও জমবে লড়াই!') == mkey('La Liga-তে আবারও জমবে লড়াই!')
+    assert mkey("আফগানিস্তানের ভারত সফর! 🔥 মাঠে নামছে") == mkey("আফগানিস্তানের ভারত সফর! মাঠে নামছে")
+    assert mkey("Squads are Ready 🏴 🆚 Pakistan") == mkey("squads are ready 🆚 pakistan")
+    # Fuzzy rescue: an edited caption still matches, but the calendar's unfilled
+    # template rows must never latch onto a real post.
+    _pk = lambda *m: [({"id": "x", "message": s}, mkey(s)[:80]) for s in m]
+    _real = "Squads are Ready. Let the Battle Begin! England vs Pakistan 3rd Test শুরু"
+    assert fuzzy_hit("Squads are Ready. Let the Battle Begin! England vs Pakistan 3rd Test",
+                     _pk(_real)) is not None
+    assert fuzzy_hit("[ম্যাচের ফলাফল ও হাইলাইট লিখুন]! ম্যাচের সেরা মুহূর্ত দেখুন tapmad-এ",
+                     _pk(_real, "[ম্যাচের ফলাফল লিখুন]! ম্যাচের সেরা দেখুন")) is None
+    assert fuzzy_hit("too short", _pk(_real)) is None
+    # Pagination: a dropped cursor after a FULL page is truncation to be resumed,
+    # not the end of the edge (the 400-vs-857 bug). Serve canned pages instead of
+    # Facebook; the fresh query and the `next` walk both come through here.
+    def _post(day): return {"id": f"p{day}", "created_time": f"2026-09-0{day}T00:00:00+0000"}
+    def _fakes(script):
+        it = iter(script)
+        def g(path, tok, **kw): return next(it)
+        return g, (lambda url, **kw: next(it))
+    real = (globals()["graph"], globals()["_get_json"])
+    try:
+        globals()["graph"], globals()["_get_json"] = _fakes([
+            {"data": [_post(5), _post(4)], "paging": {"next": "U1"}},
+            {"data": [_post(3), _post(2)]},                 # full page, cursor vanished
+            {"data": [_post(2), _post(1)]},                 # resumed: p2 is a duplicate
+            {"data": [_post(1)]}])                          # short page: genuinely done
+        got = fetch_posts("tok", "2026-09-01", "2026-09-06", limit=2)
+        assert [p["id"] for p in got] == ["p5", "p4", "p3", "p2", "p1"], got
+        # A resume that cannot reach anything older must refuse, not return a partial
+        # month — the Highlights/TikTok tabs are cleared and rebuilt from this list.
+        globals()["graph"], globals()["_get_json"] = _fakes([{"data": [_post(5), _post(4)]}] * 3)
+        try:
+            fetch_posts("tok", "2026-09-01", "2026-09-06", limit=2)
+            raise AssertionError("truncated fetch returned instead of raising")
+        except RuntimeError as e:
+            assert "cannot resume" in str(e), e
+    finally:
+        globals()["graph"], globals()["_get_json"] = real
     # TikTok rows must line up with their header, and the calendar-match column
     # must stay last — the TOTAL row and the panel both read row[10].
     assert len(TT_HDR) == 11 and TT_HDR[10] == "In content calendar?", TT_HDR
@@ -660,12 +809,14 @@ def selftest():
                    "video_views": 10, "likes": 2, "average_time_watched": 3500,
                    "full_video_watched_rate": 0.42},
                   {"create_time": 1787184000, "caption": "last month, must drop"}],
-                 {norm("Shanaka owns the stage")[:40]}, "2026-09-01")
+                 {mkey("Shanaka owns the stage")[:40]}, "2026-09-01")
     assert len(_r) == 1, _r                       # the pre-month post is excluded
     assert _r[0][10] == "Yes", _r                 # planned caption matches the tracker
     assert _r[0][8] == 3.5 and _r[0][9] == "42.0%", _r
     assert tt_rows([{"create_time": 1788998400, "caption": "ad hoc"}], set(), "2026-09-01")[0][10] \
         == "NOT IN CALENDAR"
+    assert [compact_num(x) for x in (165400, 8100000, 999, None, "165K")] \
+        == ["165.4K", "8.1M", 999, "No data", "165K"], [compact_num(165400)]
     assert LOG_HDR[:3] == ["Date", "FB followers", "FB Growth rate"], LOG_HDR
     assert LOG_HDR[-2:] == ["FB posts 24h", "Top post"] and LOG_W == 13, LOG_HDR
     # every metric header must sit one column left of its own growth header
