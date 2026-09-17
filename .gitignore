@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Team credential bundle — NEVER commit. This repo is public; a token here
+# gets scraped in minutes and auto-revoked by Meta.
+tapmad-team.env

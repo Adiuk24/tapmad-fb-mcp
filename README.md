@@ -8,7 +8,24 @@ Built on the MIT-licensed [gomarble-ai/facebook-ads-mcp-server](https://github.c
 
 ## Team quick start (2 minutes)
 
-You need two things: **Claude Code** installed, and the **Tapmad access token** — ask Arif (Head of Business & Marketing) for it. Never commit or share the token outside the team.
+**BD team — you don't need a token.** Ask Arif for the `tapmad-mcp-bundle` zip,
+unzip it, and run:
+
+```bash
+python3 install_team.py
+```
+
+It checks the shared token, installs the server, and registers it in Claude Code
+and Claude Desktop. Then fully quit Claude, reopen, and ask *"list the Tapmad
+Facebook pages"*. Re-running it is always safe.
+
+The token lives in `tapmad-team.env` inside that bundle, never in this repo —
+**this repository is public.** A Meta token pushed here is scraped within minutes
+and auto-revoked (GitHub secret scanning is a Meta partner), which would break
+the whole team at once, not just the person who pushed it.
+
+<details>
+<summary>Setting it up by hand instead (you have your own token)</summary>
 
 Run this one command (replace `PASTE_TOKEN_HERE`):
 
@@ -43,6 +60,7 @@ Or with plain pip:
 pip install git+https://github.com/Adiuk24/tapmad-fb-mcp
 claude mcp add tapmad-fb --scope user --env FB_ACCESS_TOKEN=PASTE_TOKEN_HERE -- tapmad-fb-mcp
 ```
+</details>
 </details>
 
 ---
