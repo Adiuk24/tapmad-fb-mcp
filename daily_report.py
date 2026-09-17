@@ -31,12 +31,19 @@ def find_cols(headers):
             "status": find("Status", contains=True),
             "approval": find("Approval Status") or find("Approval", contains=True)}
 
-# secrets/ids from env vars (cloud runs) with local ~/.claude.json fallback
+# secrets/ids from env vars (cloud runs) with local ~/.claude.json fallback.
+# These resolve at import, so --selftest gets placeholders instead of exiting:
+# the selftest asserts on pure functions and touches neither the network nor
+# the sheet, and requiring production secrets to run it meant it could only
+# ever pass on a machine that already had them.
+_SELFTEST = "--selftest" in sys.argv
+
 def _cfg(key):
     if os.environ.get(key): return os.environ[key]
     try:
         return json.load(open(os.path.expanduser("~/.claude.json")))["mcpServers"]["tapmad-fb"]["env"][key]
     except Exception:
+        if _SELFTEST: return f"selftest-{key}"
         raise SystemExit(f"missing config: set env {key}")
 CK, UID, FBTOK, SID = _cfg("COMPOSIO_API_KEY"), _cfg("COMPOSIO_USER_ID"), _cfg("FB_ACCESS_TOKEN"), _cfg("SHEET_ID")
 

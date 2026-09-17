@@ -1,0 +1,111 @@
+name: ci
+
+# Runs the selftests and — importantly — checks the built wheel actually
+# installs and starts. Packaging is the failure mode with the widest blast
+# radius here: this is a flat-layout project, so hatchling ships only the
+# modules listed in pyproject, and a module missing from that list takes the
+# whole MCP server down on install (every tool, not just the new one). Nothing
+# else in the repo would catch it, because a local checkout always has the file
+# on disk.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only by default. This job builds and runs code from the pull request, so
+# it should never hold a token that can write to the repo.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Steps below execute PR-authored code (the selftests, the built
+          # wheel). Without this, checkout leaves a credential in
+          # .git/config for that code to read. Nothing here pushes.
+          persist-credentials: false
+
+      # Pinned rather than relying on the image default: the scheduled report
+      # runs on `python3` here too, so the version it is tested against should
+      # not drift silently with the runner image. Also gives pip a writable
+      # environment — the system python3 is externally managed (PEP 668).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # These two run before anything is installed, on purpose: that is what
+      # proves they are still stdlib-only. The scheduled report runs on a bare
+      # runner and imports tiktok.py directly, so a new third-party import in
+      # either file would break it in production and nowhere else.
+      - name: Selftests (stdlib only — proves no dependency crept in)
+        run: |
+          python3 tiktok.py --selftest
+          python3 daily_report.py --selftest
+
+      - name: Build wheel
+        run: |
+          python -m pip install --quiet --upgrade build
+          python -m build --wheel
+
+      # A fresh venv, not the runner-global environment: the runner already has
+      # packages that could satisfy an import the wheel forgot to declare, which
+      # would let a broken dependency list pass. This mirrors what a teammate's
+      # `uvx`/`pip install` actually does.
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/python -m pip install --quiet dist/*.whl
+
+      - name: Installed wheel must import
+        # Run from outside the checkout on purpose. From the repo root, Python
+        # would import server.py and tiktok.py off the working directory and
+        # pass even when they are absent from the wheel — which is exactly the
+        # bug this step exists to catch.
+        working-directory: /tmp
+        run: |
+          /tmp/verify/bin/python -c "
+          import asyncio, server, tiktok
+          tools = asyncio.run(server.mcp.list_tools())
+          assert len(tools) >= 37, f'expected 37+ tools, got {len(tools)}'
+          assert sum('tiktok' in t.name for t in tools) == 5, 'TikTok tools missing'
+          print(f'{len(tools)} tools importable from the installed wheel')
+          "
+          /tmp/verify/bin/python -c "import server; server._tt.selftest()"
+
+      - name: Installed console script must start
+        # Importing server is not enough: it never exercises the
+        # [project.scripts] mapping or main(), so a broken entry point would
+        # pass the step above. These two cases pin both ends of main().
+        working-directory: /tmp
+        run: |
+          set +e
+          out=$(/tmp/verify/bin/tapmad-fb-mcp 2>&1); code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "expected a failure with no token, got success"; exit 1
+          fi
+          case "$out" in
+            *"Facebook token must be provided"*)
+              echo "entry point resolves and reaches main()'s token check" ;;
+            *) echo "unexpected failure from the console script:"; echo "$out"; exit 1 ;;
+          esac
+
+          # With a token it must get *past* that check into mcp.run(). stdin is
+          # /dev/null so the stdio server sees EOF and returns; the timeout is
+          # only a guard against it blocking, so 0 and 124 both mean it started.
+          set +e
+          out=$(FB_ACCESS_TOKEN=dummy timeout 30 /tmp/verify/bin/tapmad-fb-mcp </dev/null 2>&1); code=$?
+          set -e
+          case "$out" in
+            *"Facebook token must be provided"*)
+              echo "did not get past the token check"; exit 1 ;;
+          esac
+          if [ "$code" -ne 0 ] && [ "$code" -ne 124 ]; then
+            echo "console script exited $code:"; echo "$out"; exit 1
+          fi
+          echo "console script started the stdio server (exit $code)"
