@@ -16,11 +16,39 @@ leaves every other MCP server alone.
 import json, os, platform, shutil, subprocess, sys, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
-REPO = "git+https://github.com/Adiuk24/tapmad-fb-mcp"
+# A tarball of the default branch, NOT git+https://. pip can install this with
+# no git on the machine, which most BD laptops don't have — one less thing to
+# install, and one less support call, for exactly the same code.
+REPO = "https://github.com/Adiuk24/tapmad-fb-mcp/archive/refs/heads/main.tar.gz"
 ENTRY = "tapmad-fb"                       # key under "mcpServers"
 VENV = Path.home() / ".tapmad-fb-mcp"     # own venv: no PATH guessing, no clashes
 HERE = Path(__file__).resolve().parent
 WIN = platform.system() == "Windows"
+
+
+def ensure_python():
+    """Re-run under Python 3.10+ if we were started on something older.
+
+    A stock Mac answers `python3` with Apple's 3.9, and the `mcp` library needs
+    3.10+, so the naive run dies deep inside pip with "no matching distribution
+    for mcp" — a message that tells a non-technical teammate nothing. Most of
+    the team would have hit this. Look for a newer interpreter that is usually
+    already installed (Homebrew, python.org) before asking anyone to go install
+    one."""
+    if sys.version_info >= (3, 10):
+        return
+    for name in ("python3.13", "python3.12", "python3.11", "python3.10"):
+        exe = shutil.which(name)
+        if exe:
+            # flush: execv replaces the process image without draining stdout,
+            # so an unflushed line is simply lost.
+            print(f"· this computer's default Python is {platform.python_version()}; "
+                  f"using {name} instead", flush=True)
+            os.execv(exe, [exe, os.path.abspath(__file__), *sys.argv[1:]])
+    sys.exit(f"✗ this computer's Python is {platform.python_version()}, and the Tapmad MCP "
+             "needs 3.10 or newer.\n"
+             "  Install it from https://www.python.org/downloads/ (take the big yellow\n"
+             "  button, accept every default), then run this script again.")
 
 
 def load_env(path):
@@ -68,7 +96,10 @@ def install():
     if not py.exists():
         print(f"· creating {VENV}")
         subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
-    print("· installing the MCP server (needs git + network)")
+    print("· installing the MCP server (needs network)")
+    # An old venv pip chokes on modern wheels; upgrading it first is cheaper
+    # than fielding the failure. Quiet, and non-fatal if it can't reach PyPI.
+    subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--upgrade", "pip"], check=False)
     subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--upgrade", REPO], check=True)
     exe = VENV / ("Scripts/tapmad-fb-mcp.exe" if WIN else "bin/tapmad-fb-mcp")
     if not exe.exists():
@@ -113,6 +144,7 @@ def register(path, exe, env):
 
 
 def main():
+    ensure_python()
     envfile = Path(sys.argv[sys.argv.index("--env") + 1]) if "--env" in sys.argv \
         else HERE / "tapmad-team.env"
     if not envfile.exists():
